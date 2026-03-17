@@ -1,0 +1,63 @@
+{
+    "_meta": {
+        "version": 1,
+        "updated_at": null,
+        "updated_by": "baseline",
+        "baseline_metric": null
+    },
+    "game_weights": {
+        "edge_max": 40,
+        "line_movement_max": 25,
+        "injury_max": 20,
+        "price_position_max": 15,
+        "b2b_max": 5,
+        "source_penalty_max": -15
+    },
+    "edge_thresholds": {
+        "noise_floor": 0.03,
+        "noise_score": 15,
+        "high_min": 0.015,
+        "high_base": 25,
+        "sweet_min": 0.008,
+        "sweet_base": 30,
+        "mid_min": 0.005,
+        "mid_base": 15,
+        "low_min": 0.002
+    },
+    "price_position": {
+        "dead_zone_high": 0.75,
+        "low_high": 0.65,
+        "low_score": 5,
+        "mid_high": 0.55,
+        "mid_score": 10,
+        "sweet_high": 0.40,
+        "sweet_score": 15,
+        "value_high": 0.30,
+        "value_score": 12,
+        "longshot_high": 0.20,
+        "longshot_score": 5
+    },
+    "push_rules": {
+        "game_threshold": 50,
+        "min_raw_edge": 0.004,
+        "min_buy_price": 0.25,
+        "max_buy_price": 0.72
+    },
+    "kelly": {
+        "fraction": 0.25,
+        "max_size": 0.05
+    },
+    "ml": {
+        "min_samples": 30,
+        "adjustment_range": 15,
+        "adjustment_multiplier": 30
+    },
+    "prediction": {
+        "model_weight": 0.3,
+        "min_model_confidence": 0.60,
+        "min_value_edge": 0.05,
+        "max_value_edge": 0.08,
+        "min_buy_price": 0.28,
+        "max_buy_price": 0.65
+    }
+}

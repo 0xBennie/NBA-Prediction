@@ -1,0 +1,36 @@
+# Environment & secrets
+.env
+*.pem
+
+# Database
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ML models
+*.pkl
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+venv/
+.venv/
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
