@@ -53,6 +53,20 @@ CREATE TABLE IF NOT EXISTS standings (
     updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+-- ── 球员影响力评分（自动更新，替代硬编码RAPTOR）──────────────────
+CREATE TABLE IF NOT EXISTS player_ratings (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_name  TEXT UNIQUE NOT NULL,
+    team_abbr    TEXT,
+    impact_score REAL NOT NULL DEFAULT 0,
+    games_played INTEGER DEFAULT 0,
+    pts_per_game REAL DEFAULT 0,
+    reb_per_game REAL DEFAULT 0,
+    ast_per_game REAL DEFAULT 0,
+    plus_minus   REAL DEFAULT 0,
+    updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 -- ── 价格时序（盘口移动追踪）────────────────────────────────────
 CREATE TABLE IF NOT EXISTS price_history (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,

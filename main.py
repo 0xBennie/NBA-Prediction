@@ -44,6 +44,7 @@ from core.notion_sync import NotionSync
 from core.auto_trader import AutoTrader
 from core.price_watcher import PriceWatcher
 from core.injury_checker import InjuryChecker
+from ml.player_ratings import update_player_ratings
 
 logging.basicConfig(
     level=logging.INFO,
@@ -987,6 +988,80 @@ class Scanner:
 
         return resolved, resolved_list
 
+    def send_injury_report(self):
+        """每日伤病报告 — 拉取最新伤病 + 推送到Telegram"""
+        try:
+            # 获取今天有比赛的球队
+            today_games = fetch_nba_games()
+            today_teams = set()
+            for g in today_games:
+                today_teams.add(g["home_team"])
+                today_teams.add(g["away_team"])
+
+            report = self.espn.get_injury_report(list(today_teams))
+
+            if not report["total"]:
+                logger.info("[Injury] 无伤病数据")
+                return
+
+            msg = "🏥 <b>每日伤病报告</b>\n━━━━━━━━━━━━━━━\n"
+
+            # 核心球员伤停 — 最重要
+            if report["star_injuries"]:
+                msg += "\n⚠️ <b>核心球员伤停:</b>\n"
+                for inj in report["star_injuries"][:15]:
+                    today_flag = "🔴" if inj["team"] in today_teams else ""
+                    msg += f"  {today_flag}{inj['team']} <b>{inj['name']}</b> ({inj['status']})\n"
+
+            # 今日比赛伤病影响
+            if report["today_impact"]:
+                msg += "\n🏀 <b>今日比赛伤病影响:</b>\n"
+                # 按影响排序
+                sorted_impact = sorted(report["today_impact"].items(),
+                                       key=lambda x: x[1], reverse=True)
+                for abbr, impact in sorted_impact:
+                    team_inj = report["teams"].get(abbr, [])
+                    star_out = [i for i in team_inj if i["is_star"] and i["status"] in ("Out", "Doubtful")]
+                    out_count = sum(1 for i in team_inj if i["status"] in ("Out", "Doubtful"))
+                    dtd_count = sum(1 for i in team_inj if i["status"] == "Day-To-Day")
+
+                    level = "🔴" if impact >= 60 else ("🟡" if impact >= 30 else "🟢")
+                    msg += f"  {level} {abbr}: "
+                    if star_out:
+                        msg += f"⭐{'、'.join(s['name'] for s in star_out[:3])} "
+                    msg += f"({out_count}人Out"
+                    if dtd_count:
+                        msg += f", {dtd_count}人DTD"
+                    msg += f") 影响:{impact:.0f}\n"
+
+            # 今日比赛对阵伤病对比
+            if today_games:
+                msg += "\n📊 <b>今日对阵伤病对比:</b>\n"
+                for g in today_games[:8]:
+                    away = g["away_team"]
+                    home = g["home_team"]
+                    away_imp = report["today_impact"].get(away, 0)
+                    home_imp = report["today_impact"].get(home, 0)
+                    diff = home_imp - away_imp
+                    # 哪边伤得更重，对面就有优势
+                    if abs(diff) < 10:
+                        arrow = "≈"
+                    elif diff > 0:
+                        arrow = f"→ {away}利好 +{diff:.0f}"
+                    else:
+                        arrow = f"→ {home}利好 +{-diff:.0f}"
+                    msg += f"  {away}({away_imp:.0f}) @ {home}({home_imp:.0f}) {arrow}\n"
+
+            msg += f"\n━━━━━━━━━━━━━━━\n"
+            msg += f"📋 全联盟: {report['total']}人伤病, {len(report['star_injuries'])}名核心缺阵\n"
+            msg += f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+
+            send_telegram(msg)
+            logger.info(f"[Injury] 每日伤病报告已推送: {report['total']}人伤病, {len(report['star_injuries'])}核心缺阵")
+
+        except Exception as e:
+            logger.warning(f"[Injury] 每日伤病报告失败: {e}")
+
     def send_daily_summary(self):
         """每日复盘报表 — 推送到Telegram + 分析点位质量 + 自我进化"""
         try:
@@ -1528,7 +1603,7 @@ def _bootstrap_features_and_train(predictor):
     rows = con.execute("""
         SELECT game_id, home_team, away_team, game_date, home_won
         FROM historical_games WHERE features_json IS NULL
-        ORDER BY game_date DESC LIMIT 500
+        ORDER BY game_date DESC LIMIT 1000
     """).fetchall()
 
     db = Database()
@@ -1658,6 +1733,16 @@ def main():
     # 持续运行模式
     logger.info("🏀 NBA预测市场扫描器启动")
 
+    # ── 启动初始化：强制刷新数据 ──
+    logger.info("[启动] 强制刷新战绩...")
+    scanner.espn.force_refresh_standings()
+
+    logger.info("[启动] 更新球员评分...")
+    update_player_ratings(scanner.db)
+
+    logger.info("[启动] 补全历史比赛特征...")
+    _bootstrap_features_and_train(scanner.predictor)
+
     # 启动交互式AI Bot（后台线程）
     ai_bot = TelegramAIBot(scanner)
     ai_bot.start()
@@ -1666,12 +1751,16 @@ def main():
     schedule.every(1).hours.do(scanner.resolve_results)    # 每小时回填结果（免费端点）
     schedule.every().day.at("08:00").do(scanner.scan_futures)
     schedule.every().day.at("09:00").do(scanner.send_daily_summary)  # 每日报表
+    schedule.every().day.at("10:00").do(scanner.send_injury_report)  # 每日伤病报告（赛前）
+    schedule.every().day.at("18:00").do(scanner.send_injury_report)  # 赛前再更新一次
     schedule.every().day.at("00:00").do(scanner.reset_daily_count)
+    schedule.every().day.at("06:00").do(lambda: update_player_ratings(scanner.db))
 
     # 启动时立即跑一次
     scanner.scan_games()
     scanner.scan_futures()
     scanner.resolve_results()
+    scanner.send_injury_report()
 
     while True:
         schedule.run_pending()
