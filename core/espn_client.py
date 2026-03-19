@@ -213,11 +213,11 @@ class ESPNClient:
         )
         return sum(dict(r)["impact"] for r in rows) if rows else 0.0
 
-    def _refresh_all_injuries(self):
+    def _refresh_all_injuries(self, track_changes: bool = False):
         """从ESPN全局伤病端点批量拉取所有球队伤病。
 
-        ESPN单队端点(/teams/{id}/injuries)已失效返回空,
-        改用全局端点(/injuries)一次获取全部30队。
+        Args:
+            track_changes: 是否记录伤病变动到 injury_history 表
         """
         try:
             r = requests.get(
@@ -234,12 +234,22 @@ class ESPNClient:
         if not team_blocks:
             return
 
-        # 清空旧伤病数据
+        # ── 快照旧数据（用于对比变动）──
+        old_injuries = {}  # {(team, player): status}
+        if track_changes:
+            old_rows = self.db.execute("SELECT team_abbr, player_name, status, impact FROM injuries")
+            for row in old_rows:
+                d = dict(row)
+                old_injuries[(d["team_abbr"], d["player_name"])] = {
+                    "status": d["status"], "impact": d["impact"]
+                }
+
+        # ── 拉取新数据 ──
         self.db.execute("DELETE FROM injuries")
 
+        new_injuries = {}  # {(team, player): {"status": ..., "impact": ...}}
         total_count = 0
         for block in team_blocks:
-            # 全局端点结构: block.id = ESPN team ID, block.displayName = 队名
             espn_id = str(block.get("id", ""))
             team_abbr = _ESPN_ID_TO_ABBR.get(espn_id, "")
             if not team_abbr:
@@ -251,19 +261,148 @@ class ESPNClient:
                 if not name:
                     continue
                 status = inj.get("status", "Out")
-                # 优先用DB自动评分，兜底用硬编码RAPTOR
                 raptor = self._get_player_impact(name)
                 mult = STATUS_MULTIPLIER.get(status, 1.0)
-                impact = raptor * mult * 12  # 转换为Elo惩罚点数
+                impact = raptor * mult * 12
 
                 self.db.insert("""
                     INSERT INTO injuries (team_abbr, player_name, status, impact, updated_at)
                     VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """, (team_abbr, name, status, impact))
+                new_injuries[(team_abbr, name)] = {"status": status, "impact": impact}
                 total_count += 1
 
         self._injury_cache_ts = time.time()
         logger.info(f"[ESPN] 全局伤病更新: {total_count} 条伤病, {len(team_blocks)} 支球队")
+
+        # ── 记录变动 ──
+        if track_changes:
+            self._record_injury_changes(old_injuries, new_injuries)
+
+    def _record_injury_changes(self, old: dict, new: dict):
+        """对比新旧伤病名单，记录变动到 injury_history。
+
+        变动类型:
+          - recovered: 旧名单有、新名单没有 → 康复
+          - new_injury: 新名单有、旧名单没有 → 新伤
+          - status_change: 两边都有但状态变了 → 状态变化（好转/恶化）
+        """
+        changes = []
+
+        # 康复球员: 旧有新无
+        for (team, player), info in old.items():
+            if (team, player) not in new:
+                changes.append({
+                    "team": team, "player": player,
+                    "event_type": "recovered",
+                    "old_status": info["status"], "new_status": None,
+                    "impact": info["impact"],
+                })
+
+        # 新伤球员: 新有旧无
+        for (team, player), info in new.items():
+            if (team, player) not in old:
+                changes.append({
+                    "team": team, "player": player,
+                    "event_type": "new_injury",
+                    "old_status": None, "new_status": info["status"],
+                    "impact": info["impact"],
+                })
+
+        # 状态变化: 两边都有但状态不同
+        for (team, player), new_info in new.items():
+            if (team, player) in old:
+                old_info = old[(team, player)]
+                if old_info["status"] != new_info["status"]:
+                    changes.append({
+                        "team": team, "player": player,
+                        "event_type": "status_change",
+                        "old_status": old_info["status"],
+                        "new_status": new_info["status"],
+                        "impact": new_info["impact"],
+                    })
+
+        # 写入数据库
+        for c in changes:
+            try:
+                self.db.insert("""
+                    INSERT INTO injury_history
+                        (team_abbr, player_name, event_type, old_status, new_status, impact)
+                    VALUES (?,?,?,?,?,?)
+                """, (c["team"], c["player"], c["event_type"],
+                      c["old_status"], c["new_status"], c["impact"]))
+            except Exception:
+                pass
+
+        # 日志
+        recovered = [c for c in changes if c["event_type"] == "recovered"]
+        new_inj = [c for c in changes if c["event_type"] == "new_injury"]
+        status_chg = [c for c in changes if c["event_type"] == "status_change"]
+
+        if recovered:
+            names = ", ".join(f"{c['team']}-{c['player']}" for c in recovered[:5])
+            logger.info(f"[ESPN] ✅ 康复({len(recovered)}人): {names}")
+        if new_inj:
+            names = ", ".join(f"{c['team']}-{c['player']}({c['new_status']})" for c in new_inj[:5])
+            logger.info(f"[ESPN] 🚨 新伤({len(new_inj)}人): {names}")
+        if status_chg:
+            names = ", ".join(
+                f"{c['team']}-{c['player']}({c['old_status']}→{c['new_status']})"
+                for c in status_chg[:5]
+            )
+            logger.info(f"[ESPN] 🔄 状态变化({len(status_chg)}人): {names}")
+
+    def get_recent_recoveries(self, teams: list = None, days: int = 3) -> list:
+        """获取近期康复球员列表。
+
+        Args:
+            teams: 只看这些球队（None=全部）
+            days: 回看天数
+
+        Returns:
+            [{"team_abbr", "player_name", "old_status", "impact", "event_date"}]
+        """
+        if teams:
+            placeholders = ",".join(["?"] * len(teams))
+            rows = self.db.execute(f"""
+                SELECT team_abbr, player_name, old_status, impact, event_date
+                FROM injury_history
+                WHERE event_type='recovered'
+                  AND event_date >= date('now', '-{days} days')
+                  AND team_abbr IN ({placeholders})
+                ORDER BY event_date DESC, impact DESC
+            """, tuple(t.upper() for t in teams))
+        else:
+            rows = self.db.execute(f"""
+                SELECT team_abbr, player_name, old_status, impact, event_date
+                FROM injury_history
+                WHERE event_type='recovered'
+                  AND event_date >= date('now', '-{days} days')
+                ORDER BY event_date DESC, impact DESC
+            """)
+        return [dict(r) for r in rows] if rows else []
+
+    def get_recent_injury_changes(self, teams: list = None, days: int = 1) -> list:
+        """获取近期所有伤病变动（康复+新伤+状态变化）。"""
+        if teams:
+            placeholders = ",".join(["?"] * len(teams))
+            rows = self.db.execute(f"""
+                SELECT team_abbr, player_name, event_type, old_status, new_status,
+                       impact, event_date
+                FROM injury_history
+                WHERE event_date >= date('now', '-{days} days')
+                  AND team_abbr IN ({placeholders})
+                ORDER BY event_date DESC, impact DESC
+            """, tuple(t.upper() for t in teams))
+        else:
+            rows = self.db.execute(f"""
+                SELECT team_abbr, player_name, event_type, old_status, new_status,
+                       impact, event_date
+                FROM injury_history
+                WHERE event_date >= date('now', '-{days} days')
+                ORDER BY event_date DESC, impact DESC
+            """)
+        return [dict(r) for r in rows] if rows else []
 
     def get_injury_report(self, today_teams: list = None) -> dict:
         """生成每日伤病报告，返回结构化数据。
@@ -318,42 +457,51 @@ class ESPNClient:
         }
 
     def cleanup_recovered_players(self) -> dict:
-        """每日伤病清理 — 重新拉取ESPN数据，自动移除已康复球员。
+        """每日伤病清理 — 重新拉取ESPN数据，记录康复/新伤/状态变化。
 
-        ESPN全局端点只返回当前伤病名单，所以:
-          - 新拉取的数据 = 当前伤病球员
-          - _refresh_all_injuries() 会先DELETE所有旧记录再INSERT新记录
-          - 不在新数据里的球员 = 已康复 → 自动被清除
+        流程:
+          1. 快照旧伤病名单
+          2. 拉取ESPN最新数据（DELETE + INSERT）
+          3. 对比差异 → 记录到 injury_history
+          4. 返回变动摘要
         """
-        # 记录清理前的伤病数
-        before = self.db.execute_one(
-            "SELECT COUNT(*) as c FROM injuries"
-        )
+        before = self.db.execute_one("SELECT COUNT(*) as c FROM injuries")
         before_count = before["c"] if before else 0
 
-        # 强制刷新（重置缓存时间戳）
+        # 带变动追踪的刷新
         self._injury_cache_ts = 0
-        self._refresh_all_injuries()
+        self._refresh_all_injuries(track_changes=True)
 
-        # 记录清理后的伤病数
-        after = self.db.execute_one(
-            "SELECT COUNT(*) as c FROM injuries"
-        )
+        after = self.db.execute_one("SELECT COUNT(*) as c FROM injuries")
         after_count = after["c"] if after else 0
 
-        diff = before_count - after_count
-        if diff > 0:
-            logger.info(f"[ESPN] 伤病清理: {before_count} → {after_count} (清除{diff}名康复球员)")
-        elif diff < 0:
-            logger.info(f"[ESPN] 伤病更新: {before_count} → {after_count} (新增{-diff}名伤病球员)")
-        else:
-            logger.info(f"[ESPN] 伤病无变化: {after_count}名伤病球员")
+        # 查询今日变动统计
+        today_changes = self.db.execute("""
+            SELECT event_type, COUNT(*) as cnt
+            FROM injury_history
+            WHERE event_date = date('now')
+            GROUP BY event_type
+        """)
+        change_stats = {dict(r)["event_type"]: dict(r)["cnt"] for r in today_changes} if today_changes else {}
+
+        recovered_count = change_stats.get("recovered", 0)
+        new_injury_count = change_stats.get("new_injury", 0)
+        status_change_count = change_stats.get("status_change", 0)
+
+        logger.info(
+            f"[ESPN] 伤病刷新: {before_count}→{after_count} | "
+            f"康复:{recovered_count} 新伤:{new_injury_count} 状态变化:{status_change_count}"
+        )
+
+        # 清理30天前的历史记录
+        self.db.insert("DELETE FROM injury_history WHERE event_date < date('now', '-30 days')")
 
         return {
             "before": before_count,
             "after": after_count,
-            "recovered": max(0, diff),
-            "new_injuries": max(0, -diff),
+            "recovered": recovered_count,
+            "new_injuries": new_injury_count,
+            "status_changes": status_change_count,
         }
 
     # ── 背靠背判断 ────────────────────────────────────────────────

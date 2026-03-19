@@ -39,6 +39,21 @@ CREATE TABLE IF NOT EXISTS injuries (
 );
 CREATE INDEX IF NOT EXISTS idx_injuries_team ON injuries(team_abbr);
 
+-- ── 伤病变动历史（康复/新伤/状态变化）──────────────────────────
+CREATE TABLE IF NOT EXISTS injury_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    team_abbr   TEXT NOT NULL,
+    player_name TEXT NOT NULL,
+    event_type  TEXT NOT NULL,
+    old_status  TEXT,
+    new_status  TEXT,
+    impact      REAL DEFAULT 0,
+    event_date  DATE DEFAULT (date('now')),
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_injury_history_team ON injury_history(team_abbr);
+CREATE INDEX IF NOT EXISTS idx_injury_history_date ON injury_history(event_date);
+
 -- ── 战绩缓存 ────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS standings (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -254,6 +254,14 @@ class ExpertCommittee:
             star_note = f" ⚠️核心缺阵:{','.join(away_inj['star_out'])}" if away_inj.get("star_out") else ""
             parts.append(f"客队伤病: {inj_list}{star_note}")
 
+        # 近期康复球员（伤愈归来=球队利好）
+        recoveries = ctx.get("recent_recoveries", [])
+        if recoveries:
+            rec_list = ", ".join(
+                f"{r['team_abbr']}-{r['player_name']}(原{r['old_status']})" for r in recoveries[:5]
+            )
+            parts.append(f"⭐近期康复归来: {rec_list}")
+
         # B2B
         b2b = bd.get("b2b", {})
         if isinstance(b2b, dict):

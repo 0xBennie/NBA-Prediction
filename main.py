@@ -625,6 +625,9 @@ class Scanner:
                     "breakdown": result["breakdown"],
                     "home_injuries": home_injuries,
                     "away_injuries": away_injuries,
+                    "recent_recoveries": self.espn.get_recent_recoveries(
+                        [game["home_team"], game["away_team"]], days=3
+                    ),
                     "features": self.features.get_game_features(
                         game["home_team"], game["away_team"],
                         game.get("game_date", "")
@@ -813,6 +816,9 @@ class Scanner:
                     "breakdown": result.get("breakdown", {}),
                     "home_injuries": {},
                     "away_injuries": {},
+                    "recent_recoveries": self.espn.get_recent_recoveries(
+                        [team], days=3
+                    ) if team else [],
                     "features": {
                         "market_type": "futures",
                         "futures_type": mtype,
@@ -1650,6 +1656,9 @@ class Scanner:
                     "breakdown": result["breakdown"],
                     "home_injuries": home_injuries,
                     "away_injuries": away_injuries,
+                    "recent_recoveries": self.espn.get_recent_recoveries(
+                        [game["home_team"], game["away_team"]], days=3
+                    ),
                     "features": self.features.get_game_features(
                         game["home_team"], game["away_team"],
                         game.get("game_date", "")
