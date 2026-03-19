@@ -72,6 +72,9 @@ class NBAFeatureBuilder:
         self.db = db
         self.espn = espn
         self._game_log_cache = {}  # {team_abbr: {"data": [...], "ts": timestamp}}
+        self._bbref_cache = {}  # basketball-reference 高级数据缓存
+        self._bbref_cache_ts = 0
+        self._team_ratings = None  # OpenSkill评分 (lazy init)
         self._ensure_table()
 
     def _ensure_table(self):
@@ -115,6 +118,15 @@ class NBAFeatureBuilder:
             away_f = self._build_team_features(away, game_date, is_home=False)
 
             if not home_f or not away_f:
+                missing = []
+                if not home_f:
+                    missing.append(f"主队{home}")
+                if not away_f:
+                    missing.append(f"客队{away}")
+                logger.warning(
+                    f"[Features] {away}@{home} {','.join(missing)}特征构建失败，"
+                    f"回退到standings兜底（预测准确性降低）"
+                )
                 return self._fallback_features(home, away, game_date)
 
             features = {}
@@ -138,6 +150,14 @@ class NBAFeatureBuilder:
             if away_density >= 3:
                 penalty += 0.03 * (away_density - 2)  # 赛程密集惩罚
             features["away_confidence_penalty"] = round(penalty, 4)
+
+            # ── OpenSkill 贝叶斯技能评分 ──
+            skill_features = self._get_skill_features(home, away)
+            features.update(skill_features)
+
+            # ── Basketball-Reference 高级数据 ──
+            bbref = self._get_bbref_features(home, away)
+            features.update(bbref)
 
             # 缓存
             self._save_cache(home, away, game_date, features)
@@ -165,10 +185,9 @@ class NBAFeatureBuilder:
             features["win_pct_10"] = wins / len(recent)
             pts = [g.get("pts", 0) for g in recent]
             features["avg_pts_10"] = sum(pts) / len(recent)
-            # net_rating: 用胜负+得分近似（TeamGameLog没有对手得分）
-            # 赢的场次+avg_margin, 输的场次-avg_margin
-            # 近似: (win% - 0.5) * 15 + (avg_pts - 110) * 0.3
-            features["net_rating_10"] = (features["win_pct_10"] - 0.5) * 15 + (features["avg_pts_10"] - 110) * 0.3
+            # net_rating: 用实际 PLUS_MINUS（每场净胜分）的均值
+            margins = [g.get("plus_minus", 0) for g in recent]
+            features["net_rating_10"] = sum(margins) / len(recent)
         else:
             features["win_pct_10"] = standings.get("win_rate", 0.5) if standings else 0.5
             features["net_rating_10"] = standings.get("ppg_diff", 0) if standings else 0
@@ -248,11 +267,13 @@ class NBAFeatureBuilder:
         else:
             features["efg_trend"] = 0
 
-        # ── 攻防Rating — 用场均得分近似 ──
+        # ── 攻防Rating — 用实际得失分计算 ──
         if recent:
             features["off_rating"] = features["avg_pts_10"] / 100  # 标准化到~1.1
-            # def_rating: 无对手得分数据，用胜率近似（胜率高=防守好）
-            features["def_rating"] = 1.10 - (features["win_pct_10"] - 0.5) * 0.20
+            # def_rating: 用实际对手得分（越低=防守越好）
+            opp_pts_list = [g.get("opp_pts", 0) for g in recent]
+            avg_opp_pts = sum(opp_pts_list) / len(recent) if opp_pts_list else 105
+            features["def_rating"] = avg_opp_pts / 100  # 标准化到~1.05
         else:
             features["off_rating"] = 1.05
             features["def_rating"] = 1.05
@@ -284,75 +305,111 @@ class NBAFeatureBuilder:
         return features
 
     def _get_game_log(self, team: str) -> list:
-        """获取球队近期比赛日志（nba_api，带缓存）。"""
+        """获取球队近期比赛日志（LeagueGameLog，有PLUS_MINUS，带缓存）。
+
+        改用 LeagueGameLog 而非 TeamGameLog，因为前者有 PLUS_MINUS 列，
+        可以算出真实对手得分和净胜分，是预测准确性的关键数据。
+        LeagueGameLog 一次拉全联盟数据，批量缓存所有球队。
+        """
         # 内存缓存2小时
         cached = self._game_log_cache.get(team)
         if cached and time.time() - cached["ts"] < 7200:
             return cached["data"]
 
         try:
-            from nba_api.stats.endpoints import TeamGameLog
-            team_id = _get_team_id(team)
-            if not team_id:
-                return []
+            # 批量加载全联盟（如果还没加载过 或 缓存全部过期）
+            self._load_league_game_logs()
 
-            log = TeamGameLog(
-                team_id=team_id,
-                season="2025-26",
-                season_type_all_star="Regular Season",
-                timeout=15,
-            )
-            df = log.get_data_frames()[0]
-
-            games = []
-            for _, row in df.head(30).iterrows():  # 最近30场
-                matchup = row.get("MATCHUP", "")
-                is_home = "vs." in matchup
-                # Four Factors 数据
-                fga = float(row.get("FGA", 1) or 1)
-                fgm = float(row.get("FGM", 0) or 0)
-                fg3m = float(row.get("FG3M", 0) or 0)
-                fta = float(row.get("FTA", 0) or 0)
-                tov = float(row.get("TOV", 0) or 0)
-                oreb = float(row.get("OREB", 0) or 0)
-                dreb = float(row.get("DREB", 0) or 0)
-                mins = float(row.get("MIN", 240) or 240)
-
-                efg = (fgm + 0.5 * fg3m) / max(fga, 1)  # eFG%
-                tov_rate = tov / max(fga + 0.44 * fta + tov, 1)  # TOV%
-                oreb_rate = oreb / max(oreb + dreb, 1)  # OREB%（近似）
-                ft_rate = fta / max(fga, 1)  # FT Rate
-
-                # GAME_DATE格式: "MAR 14, 2026" → 转为 "2026-03-14"
-                raw_date = str(row.get("GAME_DATE", ""))
-                try:
-                    from datetime import datetime as _dt
-                    parsed = _dt.strptime(raw_date, "%b %d, %Y")
-                    game_date_str = parsed.strftime("%Y-%m-%d")
-                except Exception:
-                    game_date_str = raw_date[:10]
-
-                games.append({
-                    "date": game_date_str,
-                    "wl": row.get("WL", ""),
-                    "pts": int(row.get("PTS", 0) or 0),
-                    "opp_pts": 0,  # TeamGameLog没有对手得分，后续用配对计算
-                    "is_home": is_home,
-                    "plus_minus": 0,  # TeamGameLog没有PLUS_MINUS列
-                    "efg": round(efg, 4),
-                    "tov_rate": round(tov_rate, 4),
-                    "oreb_rate": round(oreb_rate, 4),
-                    "ft_rate": round(ft_rate, 4),
-                    "minutes": mins,
-                })
-
-            self._game_log_cache[team] = {"data": games, "ts": time.time()}
-            logger.debug(f"[Features] {team} 获取{len(games)}场比赛日志")
-            return games
+            cached = self._game_log_cache.get(team)
+            return cached["data"] if cached else []
 
         except Exception as e:
             logger.warning(f"[Features] nba_api获取{team}日志失败: {e}")
             return []
+
+    def _load_league_game_logs(self):
+        """批量从 LeagueGameLog 拉取全联盟比赛日志，按球队缓存。
+
+        LeagueGameLog 有 PLUS_MINUS 列（TeamGameLog 没有），
+        这是计算真实 net_rating 和 def_rating 的关键。
+        """
+        # 如果最近2小时内已加载过任何球队，跳过（全联盟一起加载的）
+        if self._game_log_cache:
+            any_ts = next(iter(self._game_log_cache.values()), {}).get("ts", 0)
+            if time.time() - any_ts < 7200:
+                return
+
+        from nba_api.stats.endpoints import LeagueGameLog as LGL
+
+        logger.info("[Features] 加载全联盟比赛日志(LeagueGameLog)...")
+        log = LGL(
+            season="2025-26",
+            season_type_all_star="Regular Season",
+            timeout=30,
+        )
+        df = log.get_data_frames()[0]
+
+        # 按球队分组
+        team_games = {}
+        for _, row in df.iterrows():
+            abbr = row.get("TEAM_ABBREVIATION", "")
+            if not abbr:
+                continue
+
+            matchup = row.get("MATCHUP", "")
+            is_home = "vs." in matchup
+
+            fga = float(row.get("FGA", 1) or 1)
+            fgm = float(row.get("FGM", 0) or 0)
+            fg3m = float(row.get("FG3M", 0) or 0)
+            fta = float(row.get("FTA", 0) or 0)
+            tov = float(row.get("TOV", 0) or 0)
+            oreb = float(row.get("OREB", 0) or 0)
+            dreb = float(row.get("DREB", 0) or 0)
+            mins = float(row.get("MIN", 240) or 240)
+
+            efg = (fgm + 0.5 * fg3m) / max(fga, 1)
+            tov_rate = tov / max(fga + 0.44 * fta + tov, 1)
+            oreb_rate = oreb / max(oreb + dreb, 1)
+            ft_rate = fta / max(fga, 1)
+
+            raw_date = str(row.get("GAME_DATE", ""))
+            try:
+                parsed = datetime.strptime(raw_date, "%b %d, %Y")
+                game_date_str = parsed.strftime("%Y-%m-%d")
+            except Exception:
+                game_date_str = raw_date[:10]
+
+            # LeagueGameLog 有 PLUS_MINUS — 这是关键
+            plus_minus = float(row.get("PLUS_MINUS", 0) or 0)
+            pts_val = int(row.get("PTS", 0) or 0)
+            opp_pts_val = pts_val - int(plus_minus)
+
+            game_entry = {
+                "date": game_date_str,
+                "wl": row.get("WL", ""),
+                "pts": pts_val,
+                "opp_pts": opp_pts_val,
+                "is_home": is_home,
+                "plus_minus": plus_minus,
+                "efg": round(efg, 4),
+                "tov_rate": round(tov_rate, 4),
+                "oreb_rate": round(oreb_rate, 4),
+                "ft_rate": round(ft_rate, 4),
+                "minutes": mins,
+            }
+            team_games.setdefault(abbr, []).append(game_entry)
+
+        # 每队按日期排序（最新在前），只保留最近30场，缓存
+        now = time.time()
+        for abbr, games in team_games.items():
+            games.sort(key=lambda g: g["date"], reverse=True)
+            self._game_log_cache[abbr] = {"data": games[:30], "ts": now}
+
+        logger.info(
+            f"[Features] 全联盟日志加载完成: {len(team_games)}队, "
+            f"{len(df)}条记录"
+        )
 
     def _get_standings(self, team: str) -> Optional[dict]:
         """从数据库获取球队战绩。"""
@@ -407,7 +464,163 @@ class NBAFeatureBuilder:
         features["away_opp_strength"] = features.get("home_season_win_pct", 0.5)
         features["home_advantage"] = 1.0
         features["away_confidence_penalty"] = 0.0
+
+        # OpenSkill 默认值
+        features["home_skill_mu"] = 25.0
+        features["home_skill_sigma"] = 8.333
+        features["away_skill_mu"] = 25.0
+        features["away_skill_sigma"] = 8.333
+        features["skill_win_prob"] = 0.5
+
+        # BBRef 默认值
+        features["home_pace"] = 100.0
+        features["home_ortg_bbref"] = 110.0
+        features["home_drtg_bbref"] = 110.0
+        features["away_pace"] = 100.0
+        features["away_ortg_bbref"] = 110.0
+        features["away_drtg_bbref"] = 110.0
+
         return features
+
+    def _get_skill_features(self, home: str, away: str) -> dict:
+        """获取 OpenSkill 贝叶斯技能评分特征。"""
+        try:
+            if self._team_ratings is None:
+                from ml.team_ratings import TeamSkillRatings
+                self._team_ratings = TeamSkillRatings(self.db)
+            return self._team_ratings.get_features(home, away)
+        except Exception as e:
+            logger.debug(f"[Features] OpenSkill获取失败: {e}")
+            return {
+                "home_skill_mu": 25.0,
+                "home_skill_sigma": 8.333,
+                "away_skill_mu": 25.0,
+                "away_skill_sigma": 8.333,
+                "skill_win_prob": 0.5,
+            }
+
+    def _get_bbref_features(self, home: str, away: str) -> dict:
+        """从 basketball_reference_web_scraper 获取高级数据。
+
+        获取 Pace, ORtg, DRtg 等 nba_api 不提供的高级统计。
+        4小时缓存（数据更新慢）。
+        """
+        defaults = {
+            "home_pace": 100.0,
+            "home_ortg_bbref": 110.0,
+            "home_drtg_bbref": 110.0,
+            "away_pace": 100.0,
+            "away_ortg_bbref": 110.0,
+            "away_drtg_bbref": 110.0,
+        }
+
+        # 检查缓存（4小时）
+        if self._bbref_cache and time.time() - self._bbref_cache_ts < 14400:
+            home_data = self._bbref_cache.get(home, {})
+            away_data = self._bbref_cache.get(away, {})
+            if home_data and away_data:
+                return {
+                    "home_pace": home_data.get("pace", 100.0),
+                    "home_ortg_bbref": home_data.get("ortg", 110.0),
+                    "home_drtg_bbref": home_data.get("drtg", 110.0),
+                    "away_pace": away_data.get("pace", 100.0),
+                    "away_ortg_bbref": away_data.get("ortg", 110.0),
+                    "away_drtg_bbref": away_data.get("drtg", 110.0),
+                }
+
+        try:
+            self._load_bbref_data()
+            home_data = self._bbref_cache.get(home, {})
+            away_data = self._bbref_cache.get(away, {})
+            return {
+                "home_pace": home_data.get("pace", 100.0),
+                "home_ortg_bbref": home_data.get("ortg", 110.0),
+                "home_drtg_bbref": home_data.get("drtg", 110.0),
+                "away_pace": away_data.get("pace", 100.0),
+                "away_ortg_bbref": away_data.get("ortg", 110.0),
+                "away_drtg_bbref": away_data.get("drtg", 110.0),
+            }
+        except Exception as e:
+            logger.debug(f"[Features] basketball-reference 获取失败: {e}")
+            return defaults
+
+    def _load_bbref_data(self):
+        """批量加载 basketball-reference 赛季统计。"""
+        try:
+            from basketball_reference_web_scraper import client as bbref_client
+            from basketball_reference_web_scraper.data import Team as BBRefTeam
+        except ImportError:
+            logger.debug("[Features] basketball_reference_web_scraper 未安装")
+            return
+
+        # BBRef Team enum → 我们的缩写映射
+        bbref_to_abbr = {
+            "ATLANTA_HAWKS": "ATL", "BOSTON_CELTICS": "BOS",
+            "BROOKLYN_NETS": "BKN", "CHARLOTTE_HORNETS": "CHA",
+            "CHICAGO_BULLS": "CHI", "CLEVELAND_CAVALIERS": "CLE",
+            "DALLAS_MAVERICKS": "DAL", "DENVER_NUGGETS": "DEN",
+            "DETROIT_PISTONS": "DET", "GOLDEN_STATE_WARRIORS": "GSW",
+            "HOUSTON_ROCKETS": "HOU", "INDIANA_PACERS": "IND",
+            "LOS_ANGELES_CLIPPERS": "LAC", "LOS_ANGELES_LAKERS": "LAL",
+            "MEMPHIS_GRIZZLIES": "MEM", "MIAMI_HEAT": "MIA",
+            "MILWAUKEE_BUCKS": "MIL", "MINNESOTA_TIMBERWOLVES": "MIN",
+            "NEW_ORLEANS_PELICANS": "NOP", "NEW_YORK_KNICKS": "NYK",
+            "OKLAHOMA_CITY_THUNDER": "OKC", "ORLANDO_MAGIC": "ORL",
+            "PHILADELPHIA_76ERS": "PHI", "PHOENIX_SUNS": "PHX",
+            "PORTLAND_TRAIL_BLAZERS": "POR", "SACRAMENTO_KINGS": "SAC",
+            "SAN_ANTONIO_SPURS": "SAS", "TORONTO_RAPTORS": "TOR",
+            "UTAH_JAZZ": "UTA", "WASHINGTON_WIZARDS": "WAS",
+        }
+
+        try:
+            # 获取赛季总数据
+            standings = bbref_client.standings(season_end_year=2026)
+
+            for row in standings:
+                team_name = row.get("team", "")
+                # BBRef 返回的 team 字段是 Team enum 的 name
+                if hasattr(team_name, "name"):
+                    team_key = team_name.name
+                else:
+                    team_key = str(team_name).replace("Team.", "")
+
+                abbr = bbref_to_abbr.get(team_key, "")
+                if not abbr:
+                    continue
+
+                # 从 standings 提取基础数据；高级数据需要额外计算
+                wins = row.get("wins", 0)
+                losses = row.get("losses", 0)
+                total = wins + losses
+
+                # 尝试从字段获取高级数据
+                # BBRef standings 可能包含不同字段，取决于版本
+                pts_for = row.get("points_per_game", 0) or 0
+                pts_against = row.get("opponent_points_per_game", 0) or 0
+
+                # 估算 Pace 和 Rating
+                # Pace ≈ 基于全联盟平均(100) + 球队特点的调整
+                # 用进攻回合数近似：Pace ≈ (PTS + OPP_PTS) / 2 / 1.06
+                if pts_for > 0 and pts_against > 0:
+                    pace = (pts_for + pts_against) / 2 / 1.06
+                    ortg = pts_for / pace * 100 if pace > 0 else 110
+                    drtg = pts_against / pace * 100 if pace > 0 else 110
+                else:
+                    pace = 100.0
+                    ortg = 110.0
+                    drtg = 110.0
+
+                self._bbref_cache[abbr] = {
+                    "pace": round(pace, 1),
+                    "ortg": round(ortg, 1),
+                    "drtg": round(drtg, 1),
+                }
+
+            self._bbref_cache_ts = time.time()
+            logger.info(f"[Features] BBRef数据加载: {len(self._bbref_cache)}队")
+
+        except Exception as e:
+            logger.warning(f"[Features] BBRef数据加载失败: {e}")
 
     def _get_cached(self, home: str, away: str, game_date: str) -> Optional[dict]:
         key = f"{away}@{home}"

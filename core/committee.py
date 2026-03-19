@@ -233,10 +233,26 @@ class ExpertCommittee:
 
         bd = ctx.get("breakdown", {})
 
-        # 伤病
+        # 伤病（详细）
         inj = bd.get("injury_impact", {})
         if isinstance(inj, dict):
-            parts.append(f"伤病: 主队Elo-{inj.get('home_elo_penalty', 0):.0f} / 客队Elo-{inj.get('away_elo_penalty', 0):.0f}")
+            parts.append(f"伤病Elo影响: 主队-{inj.get('home_elo_penalty', 0):.0f} / 客队-{inj.get('away_elo_penalty', 0):.0f}")
+
+        # 具体伤病球员名单
+        home_inj = ctx.get("home_injuries", {})
+        away_inj = ctx.get("away_injuries", {})
+        if home_inj and home_inj.get("all_injuries"):
+            inj_list = ", ".join(
+                f"{p['name']}({p['status']})" for p in home_inj["all_injuries"][:5]
+            )
+            star_note = f" ⚠️核心缺阵:{','.join(home_inj['star_out'])}" if home_inj.get("star_out") else ""
+            parts.append(f"主队伤病: {inj_list}{star_note}")
+        if away_inj and away_inj.get("all_injuries"):
+            inj_list = ", ".join(
+                f"{p['name']}({p['status']})" for p in away_inj["all_injuries"][:5]
+            )
+            star_note = f" ⚠️核心缺阵:{','.join(away_inj['star_out'])}" if away_inj.get("star_out") else ""
+            parts.append(f"客队伤病: {inj_list}{star_note}")
 
         # B2B
         b2b = bd.get("b2b", {})

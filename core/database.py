@@ -145,6 +145,27 @@ CREATE TABLE IF NOT EXISTS signal_log (
 CREATE INDEX IF NOT EXISTS idx_signal_log_game ON signal_log(game_id);
 CREATE INDEX IF NOT EXISTS idx_signal_log_unresolved
     ON signal_log(actual_outcome) WHERE actual_outcome IS NULL;
+
+-- ── 委员会否决记录（假阴性分析）──────────────────────────────────
+CREATE TABLE IF NOT EXISTS committee_rejections (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_id         TEXT NOT NULL,
+    away_team       TEXT,
+    home_team       TEXT,
+    buy_side        TEXT,
+    buy_team        TEXT,
+    score           INTEGER,
+    model_prob      REAL,
+    value_edge      REAL,
+    poly_price      REAL,
+    verdict         TEXT,          -- 委员会判定 (hold/sell/skip)
+    confidence      REAL,         -- 委员会信心
+    reasoning       TEXT,         -- 否决理由
+    rejection_source TEXT,        -- committee/injury/threshold
+    actual_outcome  INTEGER,      -- 赛后回填: 1=买入方向赢, 0=输, NULL=未结算
+    rejected_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_rejections_game ON committee_rejections(game_id);
 """
 
 

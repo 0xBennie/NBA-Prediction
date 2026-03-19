@@ -147,7 +147,21 @@ class ESPNClient:
             self._parse_and_cache_standings(r.json())
             logger.info("[ESPN] 战绩强制刷新完成（30队）")
         except Exception as e:
-            logger.warning(f"[ESPN] 战绩强制刷新失败: {e}")
+            logger.error(f"[ESPN] 战绩强制刷新失败: {e}")
+            # 检查缓存战绩是否过期（>12小时 = 数据不可靠）
+            stale = self.db.execute_one("""
+                SELECT MIN(strftime('%s','now') - strftime('%s', updated_at)) as age
+                FROM standings
+            """)
+            if stale and stale.get("age") is not None:
+                age_hours = float(stale["age"]) / 3600
+                if age_hours > 12:
+                    logger.error(
+                        f"[ESPN] ⚠️ 战绩数据已过期 {age_hours:.0f} 小时！"
+                        f"预测准确性可能严重下降"
+                    )
+            else:
+                logger.error("[ESPN] ⚠️ 无任何战绩缓存数据，预测将回退到默认值")
 
     def _get_player_ratings(self) -> dict:
         """获取球员评分dict，优先DB，兜底硬编码。每30分钟刷新一次。"""
@@ -301,6 +315,45 @@ class ESPNClient:
             "teams": teams,
             "star_injuries": sorted(star_injuries, key=lambda x: x["impact"], reverse=True),
             "today_impact": today_impact,
+        }
+
+    def cleanup_recovered_players(self) -> dict:
+        """每日伤病清理 — 重新拉取ESPN数据，自动移除已康复球员。
+
+        ESPN全局端点只返回当前伤病名单，所以:
+          - 新拉取的数据 = 当前伤病球员
+          - _refresh_all_injuries() 会先DELETE所有旧记录再INSERT新记录
+          - 不在新数据里的球员 = 已康复 → 自动被清除
+        """
+        # 记录清理前的伤病数
+        before = self.db.execute_one(
+            "SELECT COUNT(*) as c FROM injuries"
+        )
+        before_count = before["c"] if before else 0
+
+        # 强制刷新（重置缓存时间戳）
+        self._injury_cache_ts = 0
+        self._refresh_all_injuries()
+
+        # 记录清理后的伤病数
+        after = self.db.execute_one(
+            "SELECT COUNT(*) as c FROM injuries"
+        )
+        after_count = after["c"] if after else 0
+
+        diff = before_count - after_count
+        if diff > 0:
+            logger.info(f"[ESPN] 伤病清理: {before_count} → {after_count} (清除{diff}名康复球员)")
+        elif diff < 0:
+            logger.info(f"[ESPN] 伤病更新: {before_count} → {after_count} (新增{-diff}名伤病球员)")
+        else:
+            logger.info(f"[ESPN] 伤病无变化: {after_count}名伤病球员")
+
+        return {
+            "before": before_count,
+            "after": after_count,
+            "recovered": max(0, diff),
+            "new_injuries": max(0, -diff),
         }
 
     # ── 背靠背判断 ────────────────────────────────────────────────

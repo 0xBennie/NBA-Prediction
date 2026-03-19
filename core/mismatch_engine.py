@@ -116,16 +116,37 @@ class MismatchEngine:
                 if game_features:
                     model_home_prob = self.predictor.predict(game_features)
                     has_model = True
+                else:
+                    logger.warning(f"[Engine] {away}@{home} 无法构建特征，模型预测跳过")
             except Exception as e:
-                logger.debug(f"[Engine] 模型预测失败: {e}")
+                logger.warning(f"[Engine] {away}@{home} 模型预测异常: {e}")
         model_away_prob = 1 - model_home_prob
 
-        # ── 3. 混合概率 = 模型 × weight + Pinnacle × (1-weight) ──
+        # ── 3. 混合概率 = log-odds 空间混合 + 市场锚定 ──
+        #
+        # 研究依据:
+        #   - 线性混合 p1*w + p2*(1-w) 在极端概率时偏差大
+        #   - log-odds 混合在数学上等价于独立信息源的贝叶斯更新
+        #   - 当模型与市场分歧过大时，市场通常更准确（有效市场假说）
+        #   - 数据验证：edge>5% 信号全输 → 大分歧时必须向市场收缩
         lp = self.learned_params
         pred_cfg = lp.get("prediction", {})
-        model_weight = pred_cfg.get("model_weight", 0.3) if has_model else 0.0
-        blended_home = model_weight * model_home_prob + (1 - model_weight) * fair_home
-        blended_away = model_weight * model_away_prob + (1 - model_weight) * fair_away
+        base_model_weight = pred_cfg.get("model_weight", 0.15) if has_model else 0.0
+
+        # 自适应模型权重: 模型需要积累 track record 才给权重
+        # 研究(Wheatcroft 2024): 校准差的模型 ROI -35%, 校准好的 +35%
+        # 数据验证: 当前模型最优权重=0%, 说明模型还需要更多训练
+        # 公式: effective_w = base_w * min(1, resolved_signals / 200)
+        resolved = self.db.execute_one(
+            "SELECT COUNT(*) as c FROM signal_log WHERE prediction_correct IS NOT NULL"
+        )
+        n_resolved = resolved["c"] if resolved else 0
+        model_weight = base_model_weight * min(1.0, n_resolved / 200.0)
+
+        blended_home = self._bayesian_blend(
+            model_home_prob, fair_home, poly_home, model_weight
+        )
+        blended_away = 1.0 - blended_home
 
         # ── 4. CLOB真实买入价 ──
         clob = game.get("clob")
@@ -136,6 +157,10 @@ class MismatchEngine:
         else:
             away_buy_price = poly_away
             home_buy_price = poly_home
+            logger.warning(
+                f"[Engine] {away}@{home} CLOB不可用，回退到Gamma中间价 "
+                f"(away={poly_away:.4f} home={poly_home:.4f})，边际计算可能偏高"
+            )
 
         # ── 5. 确定买入方向：买模型认为会赢且市场低估的一方 ──
         home_value = blended_home - home_buy_price
@@ -157,6 +182,11 @@ class MismatchEngine:
             value_edge = away_value
 
         raw_edge = pinnacle_prob - buy_price
+
+        # edge 可信度衰减 — 大 edge 不代表大机会，代表大分歧（通常是模型错）
+        # 数据验证: edge 0.5-3% 甜区(正ROI), edge>5% 全输
+        edge_confidence = 1.0 / (1.0 + (value_edge / 0.03) ** 2)
+        effective_value_edge = value_edge * edge_confidence
 
         # ── 6. 伤病 + B2B ──
         home_injury = self.espn.get_injury_impact(home)
@@ -188,20 +218,24 @@ class MismatchEngine:
             "has_model": has_model,
         }
 
-        # 8.2 价值边际 (0-30): 混合概率 - 市场价格
-        if value_edge >= 0.15:
+        # 8.2 价值边际 (0-30): 用衰减后的 effective edge 评分
+        # 这确保大 edge 不会得高分（大 edge = 模型错误的概率更高）
+        ee = effective_value_edge
+        if ee >= 0.04:
             value_score = 30
-        elif value_edge >= 0.10:
-            value_score = 20 + (value_edge - 0.10) / 0.05 * 10
-        elif value_edge >= 0.05:
-            value_score = 10 + (value_edge - 0.05) / 0.05 * 10
-        elif value_edge >= 0.02:
-            value_score = (value_edge - 0.02) / 0.03 * 10
+        elif ee >= 0.03:
+            value_score = 20 + (ee - 0.03) / 0.01 * 10
+        elif ee >= 0.02:
+            value_score = 10 + (ee - 0.02) / 0.01 * 10
+        elif ee >= 0.01:
+            value_score = (ee - 0.01) / 0.01 * 10
         else:
             value_score = 0
         breakdown["value_edge"] = {
             "score": round(value_score, 1),
             "edge": round(value_edge, 4),
+            "effective_edge": round(effective_value_edge, 4),
+            "edge_confidence": round(edge_confidence, 4),
             "blended_prob": round(blended_prob, 4),
             "market_price": round(buy_price, 4),
         }
@@ -247,6 +281,11 @@ class MismatchEngine:
             }
         breakdown["raw_edge"] = round(raw_edge, 4)
         breakdown["effective_edge"] = round(value_edge, 4)
+        breakdown["data_quality"] = {
+            "has_model": has_model,
+            "has_clob": has_clob,
+            "price_source": "clob" if has_clob else "gamma_mid",
+        }
 
         # 盘口移动（保留记录）
         breakdown["line_movement"] = {
@@ -262,10 +301,11 @@ class MismatchEngine:
         kp = lp.get("kelly", {})
         kelly_frac = kp.get("fraction", 0.25)
         kelly_max = kp.get("max_size", 0.05)
-        if value_edge > 0 and buy_price > 0 and buy_price < 1:
+        if effective_value_edge > 0 and buy_price > 0 and buy_price < 1:
             b_win = (1 - buy_price) / buy_price
             kelly = blended_prob / 1.0 - (1 - blended_prob) / b_win
-            kelly = max(0, min(kelly * kelly_frac, kelly_max))
+            # Kelly 也乘以 edge_confidence，大分歧时自动缩小仓位
+            kelly = max(0, min(kelly * kelly_frac * edge_confidence, kelly_max))
         else:
             kelly = 0
 
@@ -291,21 +331,26 @@ class MismatchEngine:
         else:
             adj_confidence = min_confidence
 
-        # 数据驱动的过滤规则（基于71场回测）:
-        #   <30¢ 只有20%胜率 → 提高下限到28¢
-        #   30-60¢ 是黄金区间(71-100%胜率)
-        #   75¢+ 赢了也亏钱(ROI-24%) → 上限65¢
-        #   edge 5%+ 全输(0%胜率) → 加上限
-        #   edge 2-5% 全赢(100%胜率) → 甜区
+        # 数据驱动的过滤规则（基于506场回测，去重后89场）:
+        #   edge 0.5-3% = 甜区（37.7%胜率，正ROI）
+        #   edge 3-5% = 可以（36.8%胜率）
+        #   edge >5% = 纯噪声（客队0%胜率，主队28%） → 严格过滤
+        #   <28¢ 只有20%胜率 → 提高下限
+        #   客队买入整体21.7%胜率 → 需要更严格的门槛
+        #   推送(去重后) 61.5%胜率 → 评分高的信号质量好
 
-        max_value_edge = 0.08  # edge>8%是噪声信号（数据：5%+全输）
+        # 推送条件（使用 effective_value_edge，已经包含了可信度衰减）
+        # edge_confidence 已经自动处理了"大edge=不可信"的问题：
+        #   raw_edge=2% → effective=1.7% (可信度85%)
+        #   raw_edge=5% → effective=1.1% (可信度22%)  → 自然达不到min_value
+        #   raw_edge=10% → effective=0.9% (可信度9%) → 完全不推
         should_push = (
-            model_prob >= adj_confidence     # 根据主客场动态调整的信心门槛
-            and value_edge >= min_value      # 市场低估5%+
-            and value_edge <= max_value_edge # edge不能太大（噪声过滤）
-            and buy_price <= max_buy_price   # 价格不超过65¢（利润空间大）
-            and buy_price >= 0.28            # 不买<28¢冷门（数据：<30¢只有20%胜率）
-            and final_score >= 30            # 最低评分门槛
+            model_prob >= adj_confidence          # 根据主客场动态调整的信心门槛
+            and effective_value_edge >= min_value  # 衰减后的edge仍有足够价值
+            and buy_price <= max_buy_price         # 价格上限
+            and buy_price >= 0.30                  # 不买<30¢冷门
+            and final_score >= 45                  # 最低评分门槛（提高到45）
+            and pinnacle_agrees                    # Pinnacle必须与模型一致
         )
         breakdown["adj_confidence_threshold"] = round(adj_confidence, 4)
 
@@ -332,7 +377,8 @@ class MismatchEngine:
             "push": should_push,
             "buy_side": buy_side,
             "edge": raw_edge,
-            "effective_edge": value_edge,
+            "effective_edge": effective_value_edge,
+            "raw_value_edge": value_edge,
             "model_prob": model_prob,
             "blended_prob": blended_prob,
             "fair_prob": pinnacle_prob,
@@ -347,6 +393,53 @@ class MismatchEngine:
             "away_b2b": away_b2b,
             "breakdown": breakdown,
         }
+
+    # ── 贝叶斯概率混合 ──────────────────────────────────────────────
+    @staticmethod
+    def _bayesian_blend(model_prob: float, pinnacle_prob: float,
+                        market_price: float, model_weight: float) -> float:
+        """在 log-odds 空间混合概率，并向市场价格做贝叶斯收缩。
+
+        数学原理:
+          1. log-odds 混合 = 独立信息源的贝叶斯后验
+             logit(blended) = w * logit(model) + (1-w) * logit(pinnacle)
+          2. 分歧收缩: 当 blended 与 market 差距过大时，
+             用 shrinkage 函数把 blended 拉向 market。
+             原因: edge>5% 历史数据全输 → 大分歧 = 模型错误
+
+        公式:
+          raw_blend = logit_mix(model, pinnacle, w=0.3)
+          divergence = |raw_blend - market|
+          shrinkage = 1 / (1 + (divergence/0.03)^2)  # 3%以内几乎不收缩，5%+大幅收缩
+          final = market + shrinkage * (raw_blend - market)
+        """
+        # 边界保护
+        eps = 0.02
+        model_prob = max(eps, min(1 - eps, model_prob))
+        pinnacle_prob = max(eps, min(1 - eps, pinnacle_prob))
+        market_price = max(eps, min(1 - eps, market_price))
+
+        if model_weight <= 0:
+            raw_blend = pinnacle_prob
+        else:
+            # log-odds 空间混合
+            def logit(p):
+                return math.log(p / (1 - p))
+            def inv_logit(x):
+                return 1.0 / (1.0 + math.exp(-x))
+
+            log_model = logit(model_prob)
+            log_pinnacle = logit(pinnacle_prob)
+            log_blend = model_weight * log_model + (1 - model_weight) * log_pinnacle
+            raw_blend = inv_logit(log_blend)
+
+        # 分歧收缩: edge 越大越不可信
+        divergence = abs(raw_blend - market_price)
+        # Cauchy 收缩: 3% 以内几乎无衰减，5%+ 快速衰减到接近 0
+        shrinkage = 1.0 / (1.0 + (divergence / 0.03) ** 2)
+
+        final = market_price + shrinkage * (raw_blend - market_price)
+        return max(eps, min(1 - eps, final))
 
     # ── B2B量化 ────────────────────────────────────────────────────
     def _b2b_prob_adjustment(self, home_b2b: bool, away_b2b: bool, base_away_prob: float) -> float:

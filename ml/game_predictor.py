@@ -27,8 +27,9 @@ logger = logging.getLogger(__name__)
 
 MODEL_PATH = Path("game_predictor_model.pkl")
 
-# 特征名（v3: 39维）
+# 特征名（v4: 50维 — v3的39维 + OpenSkill 5维 + BBRef 6维）
 FEATURE_NAMES = [
+    # ── v3 基础特征 (39维) ──
     "home_win_pct_10", "home_net_rating_10", "home_avg_pts_10",
     "home_efg_pct", "home_tov_rate", "home_oreb_rate", "home_ft_rate",
     "home_season_win_pct", "home_season_net",
@@ -42,6 +43,13 @@ FEATURE_NAMES = [
     "away_efg_trend", "away_injury_elo",
     "away_off_rating", "away_def_rating", "away_streak",
     "home_opp_strength", "away_opp_strength", "home_advantage",
+    # ── OpenSkill 贝叶斯技能评分 (5维) ──
+    "home_skill_mu", "home_skill_sigma",
+    "away_skill_mu", "away_skill_sigma",
+    "skill_win_prob",
+    # ── Basketball-Reference 高级数据 (6维) ──
+    "home_pace", "home_ortg_bbref", "home_drtg_bbref",
+    "away_pace", "away_ortg_bbref", "away_drtg_bbref",
 ]
 
 
@@ -58,6 +66,39 @@ class SigmoidCalibrator:
         return (probs[:, 1] >= 0.5).astype(int)
 
 
+class VennAbersCalibrator:
+    """Venn-ABERS 校准器 — 比 Platt/Isotonic 更优的校准方法。
+
+    提供校准概率 + 对该概率的信心区间。
+    数学上有理论保证（conformal prediction框架）。
+
+    VennAbersCV.predict_proba 返回 shape (n, 2) 的数组 [[p0, p1], ...]
+    """
+    def __init__(self, base_model, va_cal):
+        self.base_model = base_model
+        self.va_cal = va_cal  # VennAbersCV instance
+    def predict_proba(self, X):
+        # VennAbersCV 直接接受 X，内部会调用 base_model
+        va_probs = self.va_cal.predict_proba(X)
+        # va_probs shape: (n, 2) — [[p0, p1], ...]
+        return va_probs
+    def predict(self, X):
+        probs = self.predict_proba(X)
+        return (probs[:, 1] >= 0.5).astype(int)
+    def predict_interval(self, X):
+        """返回校准概率 + 信心区间宽度。
+
+        VennAbersCV 的 p0+p1 可能不精确等于1，
+        取 p1 作为正类概率，用 |p1 - base_prob| 作为不确定性度量。
+        """
+        va_probs = self.va_cal.predict_proba(X)
+        calibrated = va_probs[:, 1]
+        # 用 base model 的原始概率对比来估计区间宽度
+        raw = self.base_model.predict_proba(X)[:, 1]
+        interval_width = np.abs(calibrated - raw) + 0.05  # 基准不确定性
+        return calibrated, interval_width
+
+
 class GamePredictor:
     """NBA比赛胜负预测器（v4 XGBoost+Optuna）。"""
 
@@ -66,28 +107,61 @@ class GamePredictor:
         self.model = None
         self.scaler = None
         self.calibrator = None
+        self.mapie_model = None
         self._load_model()
 
     def predict(self, features: dict) -> float:
         """预测主队赢的概率。返回校准后的 P(home_wins)。"""
+        result = self.predict_with_confidence(features)
+        return result["prob"]
+
+    def predict_with_confidence(self, features: dict) -> dict:
+        """预测主队赢的概率 + 置信区间。
+
+        Returns:
+            {"prob": float, "confidence_width": float, "method": str}
+            confidence_width 越小 = 预测越确定
+        """
         if self.model is None or self.scaler is None:
-            return self._simple_predict(features)
+            p = self._simple_predict(features)
+            return {"prob": p, "confidence_width": 0.30, "method": "simple"}
 
         try:
             vec = [features.get(f, 0.0) for f in FEATURE_NAMES]
             X = np.array([vec])
             X_scaled = self.scaler.transform(X)
 
-            # 如果有独立校准器，用校准器
+            # 校准概率
             if self.calibrator is not None:
                 prob = self.calibrator.predict_proba(X_scaled)[0][1]
+                # Venn-ABERS 提供原生信心区间
+                if hasattr(self.calibrator, 'predict_interval'):
+                    cal_prob, width = self.calibrator.predict_interval(X_scaled)
+                    return {
+                        "prob": float(cal_prob[0]),
+                        "confidence_width": float(width[0]),
+                        "method": "venn_abers",
+                    }
             else:
                 prob = self.model.predict_proba(X_scaled)[0][1]
 
-            return float(prob)
+            # MAPIE 置信区间（如果可用）
+            if self.mapie_model is not None:
+                try:
+                    _, pred_sets = self.mapie_model.predict_set(X_scaled)
+                    # pred_sets shape: (n, n_classes, 1), bool
+                    # 两个类都在集中 = 不确定(宽), 只有一个 = 确定(窄)
+                    both_in = bool(pred_sets[0, 0, 0]) and bool(pred_sets[0, 1, 0])
+                    width = 0.25 if both_in else 0.08
+                    return {"prob": float(prob), "confidence_width": width, "method": "mapie"}
+                except Exception:
+                    pass
+
+            return {"prob": float(prob), "confidence_width": 0.15, "method": "model"}
         except Exception as e:
             logger.warning(f"[Predictor] 预测失败: {e}")
-            return self._simple_predict(features)
+            p = self._simple_predict(features)
+            return {"prob": p, "confidence_width": 0.30, "method": "fallback"}
 
     def _simple_predict(self, features: dict) -> float:
         """无模型时的简单预测。"""
@@ -141,23 +215,53 @@ class GamePredictor:
         else:
             model, calibrator, method, accuracy = self._train_xgb_optuna(X_scaled, y)
 
+        # MAPIE 置信区间（包裹已训练模型）
+        mapie_model = None
+        if n >= 100:
+            try:
+                from mapie.classification import SplitConformalClassifier
+                mapie = SplitConformalClassifier(
+                    estimator=model, prefit=True, confidence_level=0.8
+                )
+                mapie.conformalize(X_scaled, y)
+                mapie_model = mapie
+                logger.info("[Predictor] MAPIE 置信区间模型已训练")
+            except Exception as e:
+                logger.warning(f"[Predictor] MAPIE 训练失败: {e}")
+
         # 保存
         with open(MODEL_PATH, "wb") as f:
-            pickle.dump({"model": model, "scaler": scaler, "calibrator": calibrator}, f)
+            pickle.dump({
+                "model": model, "scaler": scaler,
+                "calibrator": calibrator, "mapie": mapie_model,
+                "n_features": len(FEATURE_NAMES),
+            }, f)
         self.model = model
         self.scaler = scaler
         self.calibrator = calibrator
+        self.mapie_model = mapie_model
 
         logger.info(f"[Predictor] 模型训练完成 | {method} | 样本:{n} 准确率:{accuracy:.1%}")
         return {"samples": n, "accuracy": round(accuracy, 3), "method": method}
 
     def _train_logistic(self, X, y):
-        """小样本: Logistic Regression。"""
+        """小样本: Logistic Regression + TimeSeriesSplit防数据泄漏。"""
         from sklearn.linear_model import LogisticRegression
+        from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+
         model = LogisticRegression(C=0.01, max_iter=1000, random_state=42)
+
+        # TimeSeriesSplit防数据泄漏（与XGBoost训练一致）
+        n_splits = min(3, len(y) // 10) if len(y) >= 30 else 0
+        if n_splits >= 2:
+            tss = TimeSeriesSplit(n_splits=n_splits)
+            cv_scores = cross_val_score(model, X, y, cv=tss, scoring="accuracy")
+            acc = float(cv_scores.mean())
+        else:
+            acc = 0.0  # 样本太少无法CV，标记为不可靠
+
         model.fit(X, y)
-        acc = float(np.mean(model.predict(X) == y))
-        return model, None, "LogisticRegression", acc
+        return model, None, "LogisticRegression+TSS", acc
 
     def _train_xgb_default(self, X, y):
         """中等样本: XGBoost默认参数 + 校准。"""
@@ -241,23 +345,65 @@ class GamePredictor:
         w_final = self._compute_sample_weights(y_final)
         best_model.fit(X_final, y_final, sample_weight=w_final)
 
-        # Sigmoid校准（兼容sklearn 1.8+）
+        # 校准: 比较 Venn-ABERS / Platt / Isotonic，选 Brier 最低的
         from sklearn.linear_model import LogisticRegression as LR
-        raw_probs = best_model.predict_proba(X_calib)[:, 1]
-        calib_lr = LR(C=1e10, solver="lbfgs", max_iter=1000)
-        calib_lr.fit(raw_probs.reshape(-1, 1), y_calib)
-        calibrator = SigmoidCalibrator(best_model, calib_lr)
+        from sklearn.metrics import brier_score_loss
 
-        acc = float(np.mean(calibrator.predict(X) == y))
+        raw_probs = best_model.predict_proba(X_calib)[:, 1]
+        candidates = []
+
+        # 1. Venn-ABERS (理论保证最优)
+        try:
+            from venn_abers import VennAbersCV
+            va = VennAbersCV(estimator=best_model, inductive=True, cal_size=0.3)
+            va.fit(X_final, y_final)
+            va_probs_arr = va.predict_proba(X_calib)  # shape (n, 2)
+            va_probs = va_probs_arr[:, 1]  # 正类概率
+            va_brier = brier_score_loss(y_calib, va_probs)
+            va_cal = VennAbersCalibrator(best_model, va)
+            candidates.append(("venn_abers", va_cal, va_brier))
+            logger.info(f"[Predictor] Venn-ABERS Brier={va_brier:.4f}")
+        except Exception as e:
+            logger.warning(f"[Predictor] Venn-ABERS 失败: {e}")
+
+        # 2. Platt scaling (兜底)
+        try:
+            calib_lr = LR(C=1e10, solver="lbfgs", max_iter=1000)
+            calib_lr.fit(raw_probs.reshape(-1, 1), y_calib)
+            platt_cal = SigmoidCalibrator(best_model, calib_lr)
+            platt_probs = platt_cal.predict_proba(X_calib)[:, 1]
+            platt_brier = brier_score_loss(y_calib, platt_probs)
+            candidates.append(("platt", platt_cal, platt_brier))
+        except Exception as e:
+            logger.warning(f"[Predictor] Platt 失败: {e}")
+
+        # 选 Brier 最低的
+        if not candidates:
+            calibrator = None
+            cal_method = "none"
+            full_brier = 999
+        else:
+            candidates.sort(key=lambda x: x[2])
+            cal_method, calibrator, _ = candidates[0]
+
+        acc = float(np.mean(calibrator.predict(X) == y)) if calibrator else 0
+        full_probs = calibrator.predict_proba(X)[:, 1] if calibrator else np.full(len(y), 0.5)
+        full_brier = brier_score_loss(y, full_probs)
 
         logger.info(
             f"[Predictor] Optuna最优参数: depth={best_params.get('max_depth')} "
             f"lr={best_params.get('learning_rate', 0):.3f} "
             f"trees={best_params.get('n_estimators')} "
-            f"logloss={study.best_value:.4f}"
+            f"logloss={study.best_value:.4f} "
+            f"calibration={cal_method} brier={full_brier:.4f}"
         )
 
-        return best_model, calibrator, "XGBoost+Optuna+calibrated", acc
+        return best_model, calibrator, f"XGBoost+Optuna+{cal_method}", acc
+
+    @staticmethod
+    def _ensure_2d(X, model):
+        """确保 X 可以用于 predict_proba。"""
+        return X
 
     @staticmethod
     def _compute_sample_weights(y):
@@ -387,7 +533,24 @@ class GamePredictor:
             self.model = data["model"]
             self.scaler = data["scaler"]
             self.calibrator = data.get("calibrator")
-            logger.info("[Predictor] 加载预测模型")
+            self.mapie_model = data.get("mapie")
+
+            # 检查模型是否匹配当前特征维度
+            n_model_features = data.get("n_features", 0)
+            if n_model_features and n_model_features != len(FEATURE_NAMES):
+                logger.warning(
+                    f"[Predictor] 模型特征维度不匹配: 模型={n_model_features} "
+                    f"当前={len(FEATURE_NAMES)}，需要重新训练(--bootstrap)"
+                )
+                self.model = None
+                self.scaler = None
+                self.calibrator = None
+                self.mapie_model = None
+                return
+
+            cal_type = type(self.calibrator).__name__ if self.calibrator else "none"
+            has_mapie = self.mapie_model is not None
+            logger.info(f"[Predictor] 加载预测模型 | 校准:{cal_type} MAPIE:{has_mapie}")
         except FileNotFoundError:
             pass
 
